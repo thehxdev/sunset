@@ -70,13 +70,16 @@ pub fn derive_key(
     Ok(MasterKey(key_bytes))
 }
 
-pub fn encrypt_block(
-    key: &MasterKey,
+pub fn create_cipher(key: &MasterKey) -> XChaCha20Poly1305 {
+    XChaCha20Poly1305::new((&key.0).into())
+}
+
+pub fn encrypt_block_with_cipher(
+    cipher: &XChaCha20Poly1305,
     nonce: &[u8; NONCE_SIZE],
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher = XChaCha20Poly1305::new((&key.0).into());
     let xnonce = XNonce::from(*nonce);
     let payload = Payload {
         msg: plaintext,
@@ -87,13 +90,12 @@ pub fn encrypt_block(
         .map_err(|e| CryptoError::EncryptFailed(e.to_string()))
 }
 
-pub fn decrypt_block(
-    key: &MasterKey,
+pub fn decrypt_block_with_cipher(
+    cipher: &XChaCha20Poly1305,
     nonce: &[u8; NONCE_SIZE],
     ciphertext_with_tag: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher = XChaCha20Poly1305::new((&key.0).into());
     let xnonce = XNonce::from(*nonce);
     let payload = Payload {
         msg: ciphertext_with_tag,
@@ -102,6 +104,26 @@ pub fn decrypt_block(
     cipher
         .decrypt(&xnonce, payload)
         .map_err(|_| CryptoError::AuthFailed)
+}
+
+pub fn encrypt_block(
+    key: &MasterKey,
+    nonce: &[u8; NONCE_SIZE],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = create_cipher(key);
+    encrypt_block_with_cipher(&cipher, nonce, plaintext, aad)
+}
+
+pub fn decrypt_block(
+    key: &MasterKey,
+    nonce: &[u8; NONCE_SIZE],
+    ciphertext_with_tag: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = create_cipher(key);
+    decrypt_block_with_cipher(&cipher, nonce, ciphertext_with_tag, aad)
 }
 
 #[allow(clippy::type_complexity)]

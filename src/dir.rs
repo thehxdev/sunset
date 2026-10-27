@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::error::SunsetError;
 use crate::format::{bincode_config, MAX_NAME_LEN};
 use crate::inode::InodeKind;
@@ -13,12 +15,15 @@ pub struct DirEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DirectoryData {
     pub entries: Vec<DirEntry>,
+    #[serde(skip)]
+    name_map: HashMap<String, usize>,
 }
 
 impl DirectoryData {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            name_map: HashMap::new(),
         }
     }
 
@@ -31,13 +36,22 @@ impl DirectoryData {
         if slice.is_empty() {
             return Ok(Self::new());
         }
-        let (data, _): (Self, usize) = bincode::serde::decode_from_slice(slice, bincode_config())
+        let (mut data, _): (Self, usize) = bincode::serde::decode_from_slice(slice, bincode_config())
             .map_err(|e| SunsetError::Format(format!("Failed to deserialize directory: {}", e)))?;
+        let mut map = HashMap::with_capacity(data.entries.len());
+        for (idx, e) in data.entries.iter().enumerate() {
+            map.insert(e.name.clone(), idx);
+        }
+        data.name_map = map;
         Ok(data)
     }
 
     pub fn find_entry(&self, name: &str) -> Option<&DirEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        if let Some(&idx) = self.name_map.get(name) {
+            self.entries.get(idx)
+        } else {
+            self.entries.iter().find(|e| e.name == name)
+        }
     }
 
     pub fn validate_name(name: &str) -> Result<(), SunsetError> {
@@ -67,20 +81,30 @@ impl DirectoryData {
         if self.find_entry(name).is_some() {
             return Err(SunsetError::AlreadyExists(name.to_string()));
         }
+        let idx = self.entries.len();
         self.entries.push(DirEntry {
             ino,
             name: name.to_string(),
             kind,
         });
+        self.name_map.insert(name.to_string(), idx);
         Ok(())
     }
 
     pub fn remove_entry(&mut self, name: &str) -> Result<DirEntry, SunsetError> {
-        if let Some(pos) = self.entries.iter().position(|e| e.name == name) {
-            Ok(self.entries.remove(pos))
-        } else {
-            Err(SunsetError::NotFound(name.to_string()))
+        let pos = match self.name_map.remove(name) {
+            Some(idx) => idx,
+            None => self
+                .entries
+                .iter()
+                .position(|e| e.name == name)
+                .ok_or_else(|| SunsetError::NotFound(name.to_string()))?,
+        };
+        let removed = self.entries.remove(pos);
+        for idx in pos..self.entries.len() {
+            self.name_map.insert(self.entries[idx].name.clone(), idx);
         }
+        Ok(removed)
     }
 
     pub fn is_empty(&self) -> bool {

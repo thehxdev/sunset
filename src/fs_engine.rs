@@ -35,8 +35,10 @@ pub struct SunsetEngine {
     superblock: SuperblockPayload,
     active_sb_block: u64,
     inodes: HashMap<u64, Inode>,
+    dirs: HashMap<u64, DirectoryData>,
     open_inodes: HashMap<u64, usize>,
     dirty_inodes: HashSet<u64>,
+    dirty_dirs: HashSet<u64>,
     dirty_superblock: bool,
 }
 
@@ -75,13 +77,18 @@ impl SunsetEngine {
         block_dev.write_block(SUPERBLOCK_1_ID, &sb_bytes)?;
         block_dev.flush()?;
 
+        let mut dirs = HashMap::new();
+        dirs.insert(ROOT_INODE_ID, DirectoryData::new());
+
         Ok(Self {
             block_dev,
             superblock,
             active_sb_block: SUPERBLOCK_0_ID,
             inodes,
+            dirs,
             open_inodes: HashMap::new(),
             dirty_inodes: HashSet::new(),
+            dirty_dirs: HashSet::new(),
             dirty_superblock: false,
         })
     }
@@ -144,8 +151,10 @@ impl SunsetEngine {
             superblock,
             active_sb_block,
             inodes,
+            dirs: HashMap::new(),
             open_inodes: HashMap::new(),
             dirty_inodes: HashSet::new(),
+            dirty_dirs: HashSet::new(),
             dirty_superblock: false,
         })
     }
@@ -166,8 +175,7 @@ impl SunsetEngine {
         if block_id == SUPERBLOCK_0_ID || block_id == SUPERBLOCK_1_ID {
             return Ok(());
         }
-        let zero = [0u8; PLAINTEXT_BLOCK_SIZE];
-        let _ = self.block_dev.write_block(block_id, &zero);
+        self.block_dev.invalidate_block(block_id);
         self.superblock.free_blocks.push(block_id);
         self.dirty_superblock = true;
         Ok(())
@@ -469,14 +477,13 @@ impl SunsetEngine {
                 .ok_or(SunsetError::NoSpace)?;
 
             if block_offset > 0 || chunk_len < PLAINTEXT_BLOCK_SIZE {
-                let mut block_buf = if was_new {
-                    vec![0u8; PLAINTEXT_BLOCK_SIZE]
-                } else {
-                    match self.block_dev.read_block(pblock) {
-                        Ok(b) => b,
-                        Err(_) => vec![0u8; PLAINTEXT_BLOCK_SIZE],
+                let mut block_buf = [0u8; PLAINTEXT_BLOCK_SIZE];
+                if !was_new {
+                    if let Ok(b) = self.block_dev.read_block(pblock) {
+                        let len = b.len().min(PLAINTEXT_BLOCK_SIZE);
+                        block_buf[..len].copy_from_slice(&b[..len]);
                     }
-                };
+                }
                 block_buf[block_offset..block_offset + chunk_len]
                     .copy_from_slice(&data[data_offset..data_offset + chunk_len]);
                 self.block_dev.write_block(pblock, &block_buf)?;
@@ -502,7 +509,7 @@ impl SunsetEngine {
         Ok(data.len())
     }
 
-    pub fn truncate(&mut self, ino: u64, new_size: u64) -> Result<(), SunsetError> {
+    pub fn truncate_internal(&mut self, ino: u64, new_size: u64) -> Result<(), SunsetError> {
         let inode = self.get_inode(ino)?.clone();
         if new_size == inode.size {
             return Ok(());
@@ -539,10 +546,6 @@ impl SunsetEngine {
                     self.clear_block_ref(ino, lb)?;
                 }
             }
-
-            if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
-                self.compact()?;
-            }
         }
 
         let node = self.get_inode_mut(ino)?;
@@ -550,10 +553,15 @@ impl SunsetEngine {
         node.update_mtime();
         self.mark_inode_dirty(ino);
 
-        if new_size < inode.size && self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+        Ok(())
+    }
+
+    pub fn truncate(&mut self, ino: u64, new_size: u64) -> Result<(), SunsetError> {
+        self.truncate_internal(ino, new_size)?;
+        if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+            self.compact()?;
             self.flush()?;
         }
-
         Ok(())
     }
 
@@ -700,27 +708,32 @@ impl SunsetEngine {
         Ok(())
     }
 
+    pub fn ensure_dir_loaded(&mut self, ino: u64) -> Result<(), SunsetError> {
+        if !self.dirs.contains_key(&ino) {
+            let inode = self.get_inode(ino)?;
+            if inode.kind != InodeKind::Directory {
+                return Err(SunsetError::NotADirectory(format!("inode #{}", ino)));
+            }
+            let size = inode.size as usize;
+            let dir = if size == 0 {
+                DirectoryData::new()
+            } else {
+                let bytes = self.read_bytes(ino, 0, size)?;
+                DirectoryData::from_bytes(&bytes)?
+            };
+            self.dirs.insert(ino, dir);
+        }
+        Ok(())
+    }
+
     pub fn read_dir_data(&mut self, ino: u64) -> Result<DirectoryData, SunsetError> {
-        let inode = self.get_inode(ino)?;
-        if inode.kind != InodeKind::Directory {
-            return Err(SunsetError::NotADirectory(format!("inode #{}", ino)));
-        }
-        let size = inode.size as usize;
-        if size == 0 {
-            return Ok(DirectoryData::new());
-        }
-        let bytes = self.read_bytes(ino, 0, size)?;
-        DirectoryData::from_bytes(&bytes)
+        self.ensure_dir_loaded(ino)?;
+        Ok(self.dirs.get(&ino).unwrap().clone())
     }
 
     pub fn write_dir_data(&mut self, ino: u64, dir: &DirectoryData) -> Result<(), SunsetError> {
-        if dir.is_empty() {
-            self.truncate(ino, 0)?;
-            return Ok(());
-        }
-        let bytes = dir.to_bytes()?;
-        self.truncate(ino, 0)?;
-        self.write_bytes(ino, 0, &bytes)?;
+        self.dirs.insert(ino, dir.clone());
+        self.dirty_dirs.insert(ino);
         Ok(())
     }
 
@@ -732,9 +745,13 @@ impl SunsetEngine {
             let parent = self.get_inode(parent_ino)?.parent_ino;
             return self.get_inode(parent).cloned();
         }
-        let dir = self.read_dir_data(parent_ino)?;
-        let entry = dir
+        self.ensure_dir_loaded(parent_ino)?;
+        let entry = self
+            .dirs
+            .get(&parent_ino)
+            .unwrap()
             .find_entry(name)
+            .cloned()
             .ok_or_else(|| SunsetError::NotFound(name.to_string()))?;
         self.get_inode(entry.ino).cloned()
     }
@@ -747,8 +764,8 @@ impl SunsetEngine {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, SunsetError> {
-        let mut dir = self.read_dir_data(parent_ino)?;
-        if dir.find_entry(name).is_some() {
+        self.ensure_dir_loaded(parent_ino)?;
+        if self.dirs.get(&parent_ino).unwrap().find_entry(name).is_some() {
             return Err(SunsetError::AlreadyExists(name.to_string()));
         }
 
@@ -758,10 +775,11 @@ impl SunsetEngine {
 
         let file_inode = Inode::new_file(new_ino, parent_ino, mode, uid, gid);
         self.inodes.insert(new_ino, file_inode.clone());
-        self.mark_inode_dirty(new_ino);
+        self.dirty_inodes.insert(new_ino);
 
+        let dir = self.dirs.get_mut(&parent_ino).unwrap();
         dir.add_entry(new_ino, name, InodeKind::File)?;
-        self.write_dir_data(parent_ino, &dir)?;
+        self.dirty_dirs.insert(parent_ino);
 
         Ok(file_inode)
     }
@@ -774,8 +792,8 @@ impl SunsetEngine {
         uid: u32,
         gid: u32,
     ) -> Result<Inode, SunsetError> {
-        let mut dir = self.read_dir_data(parent_ino)?;
-        if dir.find_entry(name).is_some() {
+        self.ensure_dir_loaded(parent_ino)?;
+        if self.dirs.get(&parent_ino).unwrap().find_entry(name).is_some() {
             return Err(SunsetError::AlreadyExists(name.to_string()));
         }
 
@@ -785,20 +803,25 @@ impl SunsetEngine {
 
         let dir_inode = Inode::new_directory(new_ino, parent_ino, mode, uid, gid);
         self.inodes.insert(new_ino, dir_inode.clone());
-        self.mark_inode_dirty(new_ino);
+        self.dirty_inodes.insert(new_ino);
 
+        let dir = self.dirs.get_mut(&parent_ino).unwrap();
         dir.add_entry(new_ino, name, InodeKind::Directory)?;
-        self.write_dir_data(parent_ino, &dir)?;
+        self.dirty_dirs.insert(parent_ino);
 
-        let parent = self.get_inode_mut(parent_ino)?;
+        self.dirs.insert(new_ino, DirectoryData::new());
+        self.dirty_dirs.insert(new_ino);
+
+        let parent = self.inodes.get_mut(&parent_ino).unwrap();
         parent.nlink += 1;
-        self.mark_inode_dirty(parent_ino);
+        self.dirty_inodes.insert(parent_ino);
 
         Ok(dir_inode)
     }
 
     pub fn unlink(&mut self, parent_ino: u64, name: &str) -> Result<(), SunsetError> {
-        let mut dir = self.read_dir_data(parent_ino)?;
+        self.ensure_dir_loaded(parent_ino)?;
+        let dir = self.dirs.get_mut(&parent_ino).unwrap();
         let entry = dir
             .find_entry(name)
             .cloned()
@@ -808,7 +831,7 @@ impl SunsetEngine {
         }
 
         dir.remove_entry(name)?;
-        self.write_dir_data(parent_ino, &dir)?;
+        self.dirty_dirs.insert(parent_ino);
 
         let child = self.get_inode_mut(entry.ino)?;
         child.nlink = child.nlink.saturating_sub(1);
@@ -821,10 +844,6 @@ impl SunsetEngine {
                 self.inodes.remove(&entry.ino);
                 self.dirty_inodes.remove(&entry.ino);
                 self.dirty_superblock = true;
-                if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
-                    self.compact()?;
-                    self.flush()?;
-                }
             } else {
                 // Kept alive until handle is released
                 self.mark_inode_dirty(entry.ino);
@@ -837,8 +856,11 @@ impl SunsetEngine {
     }
 
     pub fn rmdir(&mut self, parent_ino: u64, name: &str) -> Result<(), SunsetError> {
-        let mut dir = self.read_dir_data(parent_ino)?;
-        let entry = dir
+        self.ensure_dir_loaded(parent_ino)?;
+        let entry = self
+            .dirs
+            .get(&parent_ino)
+            .unwrap()
             .find_entry(name)
             .cloned()
             .ok_or_else(|| SunsetError::NotFound(name.to_string()))?;
@@ -846,13 +868,16 @@ impl SunsetEngine {
             return Err(SunsetError::NotADirectory(name.to_string()));
         }
 
-        let child_dir = self.read_dir_data(entry.ino)?;
-        if !child_dir.is_empty() {
+        self.ensure_dir_loaded(entry.ino)?;
+        if !self.dirs.get(&entry.ino).unwrap().is_empty() {
             return Err(SunsetError::NotEmpty(name.to_string()));
         }
 
-        dir.remove_entry(name)?;
-        self.write_dir_data(parent_ino, &dir)?;
+        self.dirs.get_mut(&parent_ino).unwrap().remove_entry(name)?;
+        self.dirty_dirs.insert(parent_ino);
+
+        self.dirs.remove(&entry.ino);
+        self.dirty_dirs.remove(&entry.ino);
 
         self.free_all_inode_blocks(entry.ino)?;
         self.inodes.remove(&entry.ino);
@@ -862,11 +887,6 @@ impl SunsetEngine {
         let parent = self.get_inode_mut(parent_ino)?;
         parent.nlink = parent.nlink.saturating_sub(1);
         self.mark_inode_dirty(parent_ino);
-
-        if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
-            self.compact()?;
-            self.flush()?;
-        }
 
         Ok(())
     }
@@ -979,9 +999,13 @@ impl SunsetEngine {
         }
 
         // 3. Check inside indirect block trees
+        const DIRECT_BYTES: u64 = DIRECT_BLOCKS as u64 * PLAINTEXT_BLOCK_SIZE as u64;
+        const SINGLE_BYTES: u64 = DIRECT_BYTES + PTRS_PER_BLOCK as u64 * PLAINTEXT_BLOCK_SIZE as u64;
+        const DOUBLE_BYTES: u64 = SINGLE_BYTES + (PTRS_PER_BLOCK * PTRS_PER_BLOCK) as u64 * PLAINTEXT_BLOCK_SIZE as u64;
+
         for inode in self.inodes.values() {
             // Single indirect block
-            if inode.indirect_block != 0 {
+            if inode.indirect_block != 0 && inode.size > DIRECT_BYTES {
                 let raw = self.block_dev.read_block(inode.indirect_block)?;
                 let mut ptrs = decode_ptrs(&raw);
                 let mut found = false;
@@ -1000,7 +1024,7 @@ impl SunsetEngine {
             }
 
             // Double indirect block
-            if inode.double_indirect_block != 0 {
+            if inode.double_indirect_block != 0 && inode.size > SINGLE_BYTES {
                 let raw1 = self.block_dev.read_block(inode.double_indirect_block)?;
                 let mut ptrs1 = decode_ptrs(&raw1);
                 let mut found = false;
@@ -1039,7 +1063,7 @@ impl SunsetEngine {
             }
 
             // Triple indirect block
-            if inode.triple_indirect_block != 0 {
+            if inode.triple_indirect_block != 0 && inode.size > DOUBLE_BYTES {
                 let raw1 = self.block_dev.read_block(inode.triple_indirect_block)?;
                 let mut ptrs1 = decode_ptrs(&raw1);
                 let mut found = false;
@@ -1113,6 +1137,7 @@ impl SunsetEngine {
             let last_block = self.superblock.total_blocks - 1;
 
             if free_set.remove(&last_block) {
+                self.block_dev.invalidate_block(last_block);
                 self.superblock.total_blocks -= 1;
                 self.dirty_superblock = true;
                 continue;
@@ -1133,6 +1158,7 @@ impl SunsetEngine {
                         )));
                     }
 
+                    self.block_dev.invalidate_block(last_block);
                     self.superblock.total_blocks -= 1;
                     self.dirty_superblock = true;
                     continue;
@@ -1155,9 +1181,31 @@ impl SunsetEngine {
     }
 
     pub fn flush(&mut self) -> Result<(), SunsetError> {
-        if self.dirty_inodes.is_empty() && !self.dirty_superblock && self.superblock.free_blocks.is_empty() {
+        if self.dirty_inodes.is_empty()
+            && !self.dirty_superblock
+            && self.superblock.free_blocks.is_empty()
+            && self.dirty_dirs.is_empty()
+        {
             return Ok(());
         }
+
+        // 0. Flush all dirty in-memory directories to their respective inode blocks
+        let dirty_dir_ids: Vec<u64> = self.dirty_dirs.iter().copied().collect();
+        for dir_ino in dirty_dir_ids {
+            if let Some(dir) = self.dirs.get(&dir_ino) {
+                if dir.is_empty() {
+                    self.truncate_internal(dir_ino, 0)?;
+                } else {
+                    let bytes = dir.to_bytes()?;
+                    let old_size = self.get_inode(dir_ino)?.size;
+                    self.write_bytes(dir_ino, 0, &bytes)?;
+                    if (bytes.len() as u64) < old_size {
+                        self.truncate_internal(dir_ino, bytes.len() as u64)?;
+                    }
+                }
+            }
+        }
+        self.dirty_dirs.clear();
 
         // 1. Compact free blocks if auto-vacuum is enabled
         if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
@@ -1217,9 +1265,8 @@ impl SunsetEngine {
             SUPERBLOCK_0_ID
         };
 
-        // Write new superblock to target, flush to disk
+        // Write new superblock to target
         self.block_dev.write_block(target_sb_block, &sb_bytes)?;
-        self.block_dev.flush()?;
         self.active_sb_block = target_sb_block;
 
         // Truncate underlying file on disk to exact container length
@@ -1235,6 +1282,8 @@ impl SunsetEngine {
             SUPERBLOCK_0_ID
         };
         self.block_dev.write_block(other_sb_block, &sb_bytes)?;
+
+        // Flush block device (writes sorted dirty blocks to disk, file flush, sync_data)
         self.block_dev.flush()?;
 
         self.dirty_inodes.clear();

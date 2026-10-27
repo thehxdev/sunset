@@ -1,21 +1,260 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::Path;
 
 use crate::crypto::{
-    create_verification_token, derive_key, encrypt_block, decrypt_block, generate_nonce,
-    generate_salt, verify_key, MasterKey, ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST,
-    NONCE_SIZE,
+    create_cipher, create_verification_token, decrypt_block_with_cipher, derive_key,
+    encrypt_block_with_cipher, generate_nonce, generate_salt, verify_key, MasterKey,
+    ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, NONCE_SIZE,
 };
 use crate::error::SunsetError;
 use crate::format::{
     HEADER_SIZE, OnDiskHeader, PLAINTEXT_BLOCK_SIZE, STORED_BLOCK_SIZE,
 };
 
+pub const DEFAULT_CACHE_CAPACITY: usize = 2048; // 8 MB cache (2048 * 4KB)
+
+#[cfg(unix)]
+fn pwrite_exact(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(unix)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pwrite_exact(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0;
+    while written < buf.len() {
+        let n = file.seek_write(&buf[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file.seek_read(&mut buf[read..], offset + read as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pwrite_exact(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(buf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)
+}
+
+struct CacheNode {
+    block_id: u64,
+    data: Box<[u8; PLAINTEXT_BLOCK_SIZE]>,
+    dirty: bool,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+pub struct BlockCache {
+    capacity: usize,
+    nodes: Vec<CacheNode>,
+    map: HashMap<u64, usize>,
+    free_slots: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+impl BlockCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(16),
+            nodes: Vec::with_capacity(capacity),
+            map: HashMap::with_capacity(capacity),
+            free_slots: Vec::new(),
+            head: None,
+            tail: None,
+        }
+    }
+
+    fn remove_node(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if let Some(p) = prev {
+            self.nodes[p].next = next;
+        } else if self.head == Some(idx) {
+            self.head = next;
+        }
+        if let Some(n) = next {
+            self.nodes[n].prev = prev;
+        } else if self.tail == Some(idx) {
+            self.tail = prev;
+        }
+        self.nodes[idx].prev = None;
+        self.nodes[idx].next = None;
+    }
+
+    fn push_head(&mut self, idx: usize) {
+        self.nodes[idx].prev = None;
+        self.nodes[idx].next = self.head;
+        if let Some(h) = self.head {
+            self.nodes[h].prev = Some(idx);
+        }
+        self.head = Some(idx);
+        if self.tail.is_none() {
+            self.tail = Some(idx);
+        }
+    }
+
+    fn move_to_head(&mut self, idx: usize) {
+        if self.head != Some(idx) {
+            self.remove_node(idx);
+            self.push_head(idx);
+        }
+    }
+
+    fn pop_tail(&mut self) -> Option<usize> {
+        let t = self.tail?;
+        self.remove_node(t);
+        Some(t)
+    }
+
+    pub fn get(&mut self, block_id: u64) -> Option<&[u8; PLAINTEXT_BLOCK_SIZE]> {
+        if let Some(&idx) = self.map.get(&block_id) {
+            self.move_to_head(idx);
+            Some(&*self.nodes[idx].data)
+        } else {
+            None
+        }
+    }
+
+    pub fn put(
+        &mut self,
+        block_id: u64,
+        data: Box<[u8; PLAINTEXT_BLOCK_SIZE]>,
+        dirty: bool,
+    ) -> Option<(u64, Box<[u8; PLAINTEXT_BLOCK_SIZE]>)> {
+        if let Some(&idx) = self.map.get(&block_id) {
+            self.nodes[idx].data = data;
+            self.nodes[idx].dirty |= dirty;
+            self.move_to_head(idx);
+            return None;
+        }
+
+        if let Some(slot) = self.free_slots.pop() {
+            self.nodes[slot] = CacheNode {
+                block_id,
+                data,
+                dirty,
+                prev: None,
+                next: None,
+            };
+            self.push_head(slot);
+            self.map.insert(block_id, slot);
+            return None;
+        }
+
+        if self.nodes.len() < self.capacity {
+            let slot = self.nodes.len();
+            self.nodes.push(CacheNode {
+                block_id,
+                data,
+                dirty,
+                prev: None,
+                next: None,
+            });
+            self.push_head(slot);
+            self.map.insert(block_id, slot);
+            return None;
+        }
+
+        // Evict LRU tail
+        let tail_idx = self.pop_tail()?;
+        let evicted_block = self.nodes[tail_idx].block_id;
+        let evicted_dirty = self.nodes[tail_idx].dirty;
+        self.map.remove(&evicted_block);
+
+        let evicted_data = if evicted_dirty {
+            Some((evicted_block, self.nodes[tail_idx].data.clone()))
+        } else {
+            None
+        };
+
+        self.nodes[tail_idx].block_id = block_id;
+        self.nodes[tail_idx].data = data;
+        self.nodes[tail_idx].dirty = dirty;
+        self.push_head(tail_idx);
+        self.map.insert(block_id, tail_idx);
+
+        evicted_data
+    }
+
+    pub fn invalidate(&mut self, block_id: u64) {
+        if let Some(idx) = self.map.remove(&block_id) {
+            self.remove_node(idx);
+            self.free_slots.push(idx);
+        }
+    }
+
+    pub fn invalidate_above_or_equal(&mut self, threshold_block: u64) {
+        let to_remove: Vec<u64> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|&id| id >= threshold_block)
+            .collect();
+        for id in to_remove {
+            self.invalidate(id);
+        }
+    }
+
+    pub fn take_dirty_sorted(&mut self) -> Vec<(u64, Box<[u8; PLAINTEXT_BLOCK_SIZE]>)> {
+        let mut dirty = Vec::new();
+        for node in &mut self.nodes {
+            if node.dirty && self.map.contains_key(&node.block_id) {
+                dirty.push((node.block_id, node.data.clone()));
+                node.dirty = false;
+            }
+        }
+        dirty.sort_unstable_by_key(|&(id, _)| id);
+        dirty
+    }
+}
+
 pub struct BlockDevice {
     file: File,
     key: MasterKey,
     header: OnDiskHeader,
+    cipher: chacha20poly1305::XChaCha20Poly1305,
+    file_len: u64,
+    cache: BlockCache,
 }
 
 impl BlockDevice {
@@ -44,7 +283,7 @@ impl BlockDevice {
             verify_tag,
         );
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -58,10 +297,20 @@ impl BlockDevice {
             })?;
 
         let header_bytes = header.to_bytes()?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header_bytes)?;
+        pwrite_exact(&file, &header_bytes, 0)?;
 
-        let mut dev = Self { file, key, header };
+        let cipher = create_cipher(&key);
+        let file_len = header_bytes.len() as u64;
+        let cache = BlockCache::new(DEFAULT_CACHE_CAPACITY);
+
+        let mut dev = Self {
+            file,
+            key,
+            header,
+            cipher,
+            file_len,
+            cache,
+        };
 
         if let Some(blocks) = initial_blocks {
             let zero_block = [0u8; PLAINTEXT_BLOCK_SIZE];
@@ -70,13 +319,12 @@ impl BlockDevice {
             }
         }
 
-        dev.file.flush()?;
-        dev.file.sync_data()?;
+        dev.flush()?;
         Ok(dev)
     }
 
     pub fn open(path: &Path, passphrase: &str) -> Result<Self, SunsetError> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -87,16 +335,21 @@ impl BlockDevice {
                 ))
             })?;
 
+        let file_len = file.metadata()?.len();
+        if file_len < HEADER_SIZE as u64 {
+            return Err(SunsetError::Format(
+                "Archive file is too small to contain valid Sunset header".to_string(),
+            ));
+        }
+
         let mut header_buf = [0u8; HEADER_SIZE];
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut header_buf)
-            .map_err(|e| {
-                SunsetError::Format(format!(
-                    "Failed to read archive header from '{}': {}",
-                    path.display(),
-                    e
-                ))
-            })?;
+        pread_exact(&file, &mut header_buf, 0).map_err(|e| {
+            SunsetError::Format(format!(
+                "Failed to read archive header from '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
 
         let header = OnDiskHeader::from_bytes(&header_buf)?;
 
@@ -111,7 +364,17 @@ impl BlockDevice {
         verify_key(&key, &header.verify_nonce, &header.verify_ct, &header.verify_tag)
             .map_err(|_| SunsetError::InvalidKey)?;
 
-        Ok(Self { file, key, header })
+        let cipher = create_cipher(&key);
+        let cache = BlockCache::new(DEFAULT_CACHE_CAPACITY);
+
+        Ok(Self {
+            file,
+            key,
+            header,
+            cipher,
+            file_len,
+            cache,
+        })
     }
 
     pub fn header(&self) -> &OnDiskHeader {
@@ -126,62 +389,97 @@ impl BlockDevice {
         HEADER_SIZE as u64 + block_index * STORED_BLOCK_SIZE as u64
     }
 
-    pub fn read_block(&mut self, block_index: u64) -> Result<Vec<u8>, SunsetError> {
+    fn write_block_to_disk(
+        &self,
+        block_index: u64,
+        data: &[u8; PLAINTEXT_BLOCK_SIZE],
+    ) -> Result<(), SunsetError> {
         let offset = Self::block_offset(block_index);
-        let file_len = self.file.metadata()?.len();
+        let nonce = generate_nonce();
+        let aad = block_index.to_le_bytes();
+        let ciphertext = encrypt_block_with_cipher(&self.cipher, &nonce, data, &aad)?;
 
-        if offset + STORED_BLOCK_SIZE as u64 > file_len {
-            return Err(SunsetError::CorruptedBlock(block_index));
-        }
-
-        self.file.seek(SeekFrom::Start(offset))?;
         let mut raw_buf = vec![0u8; STORED_BLOCK_SIZE];
-        self.file.read_exact(&mut raw_buf)?;
+        raw_buf[..NONCE_SIZE].copy_from_slice(&nonce);
+        raw_buf[NONCE_SIZE..].copy_from_slice(&ciphertext);
+
+        pwrite_exact(&self.file, &raw_buf, offset)?;
+        Ok(())
+    }
+
+    fn read_block_from_disk(&self, block_index: u64) -> Result<Vec<u8>, SunsetError> {
+        let offset = Self::block_offset(block_index);
+        let mut raw_buf = vec![0u8; STORED_BLOCK_SIZE];
+        pread_exact(&self.file, &mut raw_buf, offset)?;
 
         let mut nonce = [0u8; NONCE_SIZE];
         nonce.copy_from_slice(&raw_buf[..NONCE_SIZE]);
         let ciphertext = &raw_buf[NONCE_SIZE..];
 
         let aad = block_index.to_le_bytes();
-        let decrypted = decrypt_block(&self.key, &nonce, ciphertext, &aad)
+        let decrypted = decrypt_block_with_cipher(&self.cipher, &nonce, ciphertext, &aad)
             .map_err(|_| SunsetError::CorruptedBlock(block_index))?;
 
         Ok(decrypted)
     }
 
-    pub fn write_block(&mut self, block_index: u64, data: &[u8]) -> Result<(), SunsetError> {
-        let offset = Self::block_offset(block_index);
+    pub fn read_block(&mut self, block_index: u64) -> Result<Vec<u8>, SunsetError> {
+        if let Some(cached) = self.cache.get(block_index) {
+            return Ok(cached.to_vec());
+        }
 
-        let mut payload = [0u8; PLAINTEXT_BLOCK_SIZE];
+        let offset = Self::block_offset(block_index);
+        if offset + STORED_BLOCK_SIZE as u64 > self.file_len {
+            return Err(SunsetError::CorruptedBlock(block_index));
+        }
+
+        let decrypted = self.read_block_from_disk(block_index)?;
+        let mut box_data = Box::new([0u8; PLAINTEXT_BLOCK_SIZE]);
+        box_data.copy_from_slice(&decrypted);
+
+        if let Some((evicted_id, evicted_data)) = self.cache.put(block_index, box_data, false) {
+            self.write_block_to_disk(evicted_id, &evicted_data)?;
+        }
+
+        Ok(decrypted)
+    }
+
+    pub fn write_block(&mut self, block_index: u64, data: &[u8]) -> Result<(), SunsetError> {
+        let mut payload = Box::new([0u8; PLAINTEXT_BLOCK_SIZE]);
         let copy_len = data.len().min(PLAINTEXT_BLOCK_SIZE);
         payload[..copy_len].copy_from_slice(&data[..copy_len]);
 
-        let nonce = generate_nonce();
-        let aad = block_index.to_le_bytes();
-        let ciphertext = encrypt_block(&self.key, &nonce, &payload, &aad)?;
+        let end_offset = Self::block_offset(block_index) + STORED_BLOCK_SIZE as u64;
+        if end_offset > self.file_len {
+            self.file_len = end_offset;
+        }
 
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&nonce)?;
-        self.file.write_all(&ciphertext)?;
+        if let Some((evicted_id, evicted_data)) = self.cache.put(block_index, payload, true) {
+            self.write_block_to_disk(evicted_id, &evicted_data)?;
+        }
 
         Ok(())
     }
 
+    pub fn invalidate_block(&mut self, block_index: u64) {
+        self.cache.invalidate(block_index);
+    }
+
     pub fn total_blocks_on_disk(&mut self) -> Result<u64, SunsetError> {
-        let file_len = self.file.metadata()?.len();
-        if file_len < HEADER_SIZE as u64 {
+        if self.file_len < HEADER_SIZE as u64 {
             return Ok(0);
         }
-        Ok((file_len - HEADER_SIZE as u64) / STORED_BLOCK_SIZE as u64)
+        Ok((self.file_len - HEADER_SIZE as u64) / STORED_BLOCK_SIZE as u64)
     }
 
     pub fn file_size(&self) -> Result<u64, SunsetError> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file_len)
     }
 
     pub fn truncate(&mut self, total_blocks: u64) -> Result<(), SunsetError> {
-        let new_len = Self::block_offset(total_blocks);
-        self.file.set_len(new_len)?;
+        self.cache.invalidate_above_or_equal(total_blocks);
+        self.file_len = Self::block_offset(total_blocks);
+        self.file.set_len(self.file_len)?;
         self.file.flush()?;
         self.file.sync_data()?;
         Ok(())
@@ -190,14 +488,17 @@ impl BlockDevice {
     pub fn update_header_change_counter(&mut self, counter: u64) -> Result<(), SunsetError> {
         self.header.change_counter = counter;
         let bytes = self.header.to_bytes()?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&bytes)?;
+        pwrite_exact(&self.file, &bytes, 0)?;
         self.file.flush()?;
         self.file.sync_data()?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), SunsetError> {
+        let dirty = self.cache.take_dirty_sorted();
+        for (bid, data) in dirty {
+            self.write_block_to_disk(bid, &data)?;
+        }
         self.file.flush()?;
         self.file.sync_data()?;
         Ok(())
