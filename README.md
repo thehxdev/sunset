@@ -54,8 +54,12 @@ All multi-byte numeric values are encoded in standard **Little-Endian**.
 ### 2. Physical Block Structure (Offset 0x0100+, 4136 bytes each)
 
 Every physical block on disk contains:
-$$\text{Stored Block} = \text{Nonce}_{24} \,\|\, \text{Ciphertext}_{4096} \,\|\, \text{Poly1305 Tag}_{16}$$
-- **Additional Authenticated Data (AAD)**: $\text{Physical Block Index}_{\text{u64 (LE)}}$.
+
+```text
+Stored Block (4136 bytes) = Nonce (24 bytes) || Ciphertext (4096 bytes) || Poly1305 Tag (16 bytes)
+```
+
+- **Additional Authenticated Data (AAD)**: Physical Block Index (`u64`, Little-Endian).
 
 ### 3. Dual-Superblock Layout (Blocks 0 & 1)
 - **Block 0 (Offset 256)**: Superblock Primary
@@ -81,7 +85,7 @@ $$\text{Stored Block} = \text{Nonce}_{24} \,\|\, \text{Ciphertext}_{4096} \,\|\,
 ## Installation & Build
 
 ### Prerequisites
-- Linux OS with kernel $\ge 4.5$
+- Linux OS with kernel >= 4.5
 - `fuse3` / `fusermount3` installed:
   - openSUSE / SLES: `zypper install fuse3`
   - Debian / Ubuntu: `apt install fuse3 libfuse3-3`
