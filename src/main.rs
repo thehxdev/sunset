@@ -171,13 +171,9 @@ fn run() -> Result<(), SunsetError> {
                 archive.display(),
                 mountpoint.display()
             );
-            println!(
-                "File-system mounted successfully. Press Ctrl+C or run 'fusermount3 -u {}' to unmount.",
-                mountpoint.display()
-            );
 
             let fs = SunsetFuseFs::new(engine, is_ro);
-            fuser::mount(fs, &mountpoint, &config).map_err(|e| {
+            let mut session = fuser::Session::new(fs, &mountpoint, &config).map_err(|e| {
                 SunsetError::Io(std::io::Error::new(
                     e.kind(),
                     format!(
@@ -187,6 +183,72 @@ fn run() -> Result<(), SunsetError> {
                     ),
                 ))
             })?;
+
+            println!(
+                "File-system mounted successfully. Press Ctrl+C or run 'fusermount3 -u {}' to unmount.",
+                mountpoint.display()
+            );
+
+            let unmounter = std::sync::Arc::new(std::sync::Mutex::new(session.unmount_callable()));
+            let mountpoint_clone = mountpoint.clone();
+            let unmounter_clone = unmounter.clone();
+            let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let signal_count_clone = signal_count.clone();
+
+            let _ = ctrlc::set_handler(move || {
+                let count = signal_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if count == 1 {
+                    eprintln!(
+                        "\nReceived shutdown signal (Ctrl+C). Gracefully unmounting {}...",
+                        mountpoint_clone.display()
+                    );
+                    if let Ok(mut u) = unmounter_clone.lock() {
+                        let _ = u.unmount();
+                    }
+                    let _ = std::process::Command::new("fusermount3")
+                        .arg("-u")
+                        .arg("-q")
+                        .arg("-z")
+                        .arg(&mountpoint_clone)
+                        .status();
+                } else {
+                    eprintln!(
+                        "\nForce exiting: detaching {}...",
+                        mountpoint_clone.display()
+                    );
+                    let _ = std::process::Command::new("fusermount3")
+                        .arg("-u")
+                        .arg("-q")
+                        .arg("-z")
+                        .arg(&mountpoint_clone)
+                        .status();
+                    std::process::exit(0);
+                }
+            });
+
+            if let Err(e) = session.run() {
+                if e.kind() != std::io::ErrorKind::NotConnected
+                    && e.raw_os_error() != Some(libc::ENODEV)
+                {
+                    return Err(SunsetError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("FUSE session error on '{}': {}", mountpoint.display(), e),
+                    )));
+                }
+            }
+
+            // Cleanup mount if needed
+            if let Ok(mut u) = unmounter.lock() {
+                let _ = u.unmount();
+            }
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg("-q")
+                .arg("-z")
+                .arg(&mountpoint)
+                .status();
+
+            println!("Unmounted {} successfully.", mountpoint.display());
         }
 
         Commands::Check {

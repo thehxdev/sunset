@@ -66,6 +66,14 @@ impl SunsetFuseFs {
     }
 }
 
+impl Drop for SunsetFuseFs {
+    fn drop(&mut self) {
+        if let Ok(mut engine) = self.engine.lock() {
+            let _ = engine.flush();
+        }
+    }
+}
+
 impl Filesystem for SunsetFuseFs {
     fn destroy(&mut self) {
         if let Ok(mut engine) = self.engine.lock() {
