@@ -48,16 +48,19 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// Standard deterministic bincode configuration for cross-platform portability.
 /// Forces fixed-width integers (no varint variance) and Little-Endian byte order.
+pub const MAX_BINCODE_LIMIT: usize = 64 * 1024 * 1024; // 64 MB limit prevents OOM bombs on corrupted input
+
 pub type BincodeConfig = bincode::config::Configuration<
     bincode::config::LittleEndian,
     bincode::config::Fixint,
-    bincode::config::NoLimit,
+    bincode::config::Limit<MAX_BINCODE_LIMIT>,
 >;
 
 pub fn bincode_config() -> BincodeConfig {
     bincode::config::standard()
         .with_fixed_int_encoding()
         .with_little_endian()
+        .with_limit::<MAX_BINCODE_LIMIT>()
 }
 
 /// Fixed 256-byte plaintext on-disk header at offset 0 of every Sunset archive.

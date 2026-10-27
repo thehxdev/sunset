@@ -294,6 +294,26 @@ Error: Archive data integrity violation: block #14 failed cryptographic authenti
 
 ---
 
+## Testing & Quality Assurance
+
+`sunset` maintains an extensive test suite covering every layer:
+
+```bash
+# Run all unit and integration tests
+cargo test
+
+# Run fuzz testing (header/superblock/directory parsers, AAD tampering, bitflips)
+cargo test --test fuzz_test
+
+# Run high-concurrency stress testing (multi-threading, churn, crash recovery)
+cargo test --test stress_test
+
+# Run performance benchmarks
+cargo test --test perf_test --release -- --nocapture
+```
+
+---
+
 ## Security Guarantees
 
 1. **Confidentiality**: Plaintext blocks encrypted with 256-bit XChaCha20. No plaintext leaks into container.

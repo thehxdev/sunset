@@ -40,6 +40,11 @@ impl DirectoryData {
             .map_err(|e| SunsetError::Format(format!("Failed to deserialize directory: {}", e)))?;
         let mut map = HashMap::with_capacity(data.entries.len());
         for (idx, e) in data.entries.iter().enumerate() {
+            if Self::validate_name(&e.name).is_err() {
+                return Err(SunsetError::Format(
+                    "Invalid directory entry name in archive".to_string(),
+                ));
+            }
             map.insert(e.name.clone(), idx);
         }
         data.name_map = map;
