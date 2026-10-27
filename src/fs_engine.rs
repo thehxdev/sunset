@@ -55,7 +55,7 @@ impl SunsetEngine {
         inodes.insert(ROOT_INODE_ID, root_inode);
 
         // Serialize root inode
-        let inode_bytes = bincode::serialize(&inodes)
+        let inode_bytes = bincode::serde::encode_to_vec(&inodes, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize initial inodes: {}", e)))?;
 
         // Allocate block for initial inode table
@@ -68,7 +68,7 @@ impl SunsetEngine {
         block_dev.write_block(inode_block, &block_data)?;
 
         // Write both superblocks
-        let sb_bytes = bincode::serialize(&superblock)
+        let sb_bytes = bincode::serde::encode_to_vec(&superblock, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize superblock: {}", e)))?;
         block_dev.write_block(SUPERBLOCK_0_ID, &sb_bytes)?;
         block_dev.write_block(SUPERBLOCK_1_ID, &sb_bytes)?;
@@ -92,12 +92,20 @@ impl SunsetEngine {
         let sb0: Option<SuperblockPayload> = block_dev
             .read_block(SUPERBLOCK_0_ID)
             .ok()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok());
+            .and_then(|bytes| {
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                    .ok()
+                    .map(|(sb, _)| sb)
+            });
 
         let sb1: Option<SuperblockPayload> = block_dev
             .read_block(SUPERBLOCK_1_ID)
             .ok()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok());
+            .and_then(|bytes| {
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                    .ok()
+                    .map(|(sb, _)| sb)
+            });
 
         let (superblock, active_sb_block) = match (sb0, sb1) {
             (Some(s0), Some(s1)) => {
@@ -121,9 +129,12 @@ impl SunsetEngine {
         let inodes: HashMap<u64, Inode> = if all_inode_bytes.is_empty() {
             HashMap::new()
         } else {
-            bincode::deserialize(&all_inode_bytes).map_err(|e| {
-                SunsetError::Format(format!("Failed to deserialize inode table: {}", e))
-            })?
+            let (nodes, _): (HashMap<u64, Inode>, usize) =
+                bincode::serde::decode_from_slice(&all_inode_bytes, bincode::config::standard())
+                    .map_err(|e| {
+                        SunsetError::Format(format!("Failed to deserialize inode table: {}", e))
+                    })?;
+            nodes
         };
 
         Ok(Self {
@@ -902,7 +913,7 @@ impl SunsetEngine {
         }
 
         // Serialize all inodes
-        let inode_bytes = bincode::serialize(&self.inodes)
+        let inode_bytes = bincode::serde::encode_to_vec(&self.inodes, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize inodes: {}", e)))?;
 
         let needed_blocks = ((inode_bytes.len() + PLAINTEXT_BLOCK_SIZE - 1)
@@ -941,7 +952,7 @@ impl SunsetEngine {
             .unwrap_or_default()
             .as_secs();
 
-        let sb_bytes = bincode::serialize(&self.superblock)
+        let sb_bytes = bincode::serde::encode_to_vec(&self.superblock, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize superblock: {}", e)))?;
 
         let target_sb_block = if self.active_sb_block == SUPERBLOCK_0_ID {

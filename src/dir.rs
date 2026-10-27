@@ -23,7 +23,7 @@ impl DirectoryData {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SunsetError> {
-        bincode::serialize(self)
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize directory: {}", e)))
     }
 
@@ -31,8 +31,9 @@ impl DirectoryData {
         if slice.is_empty() {
             return Ok(Self::new());
         }
-        bincode::deserialize(slice)
-            .map_err(|e| SunsetError::Format(format!("Failed to deserialize directory: {}", e)))
+        let (data, _): (Self, usize) = bincode::serde::decode_from_slice(slice, bincode::config::standard())
+            .map_err(|e| SunsetError::Format(format!("Failed to deserialize directory: {}", e)))?;
+        Ok(data)
     }
 
     pub fn find_entry(&self, name: &str) -> Option<&DirEntry> {

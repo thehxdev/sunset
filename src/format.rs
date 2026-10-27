@@ -55,7 +55,7 @@ impl OnDiskHeader {
     }
 
     pub fn to_bytes(&self) -> Result<[u8; HEADER_SIZE], SunsetError> {
-        let serialized = bincode::serialize(self)
+        let serialized = bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize header: {}", e)))?;
         if serialized.len() > HEADER_SIZE {
             return Err(SunsetError::Format("Header exceeds 256 bytes".to_string()));
@@ -71,9 +71,8 @@ impl OnDiskHeader {
                 "Header is too short to be a valid Sunset archive".to_string(),
             ));
         }
-        let header: Self = bincode::deserialize(bytes).map_err(|e| {
-            SunsetError::Format(format!("Failed to deserialize archive header: {}", e))
-        })?;
+        let (header, _): (Self, usize) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| SunsetError::Format(format!("Failed to deserialize archive header: {}", e)))?;
         if &header.magic != MAGIC {
             return Err(SunsetError::Format(
                 "Invalid archive header: magic bytes mismatch (not a Sunset archive)".to_string(),
