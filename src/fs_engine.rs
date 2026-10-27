@@ -5,8 +5,8 @@ use crate::block_io::BlockDevice;
 use crate::dir::DirectoryData;
 use crate::error::SunsetError;
 use crate::format::{
-    FIRST_ALLOCATABLE_BLOCK, PLAINTEXT_BLOCK_SIZE, ROOT_INODE_ID, SUPERBLOCK_0_ID,
-    SUPERBLOCK_1_ID, SuperblockPayload,
+    bincode_config, AUTO_VACUUM_FULL, FIRST_ALLOCATABLE_BLOCK, PLAINTEXT_BLOCK_SIZE,
+    ROOT_INODE_ID, SUPERBLOCK_0_ID, SUPERBLOCK_1_ID, SuperblockPayload,
 };
 use crate::inode::{
     DIRECT_BLOCKS, Inode, InodeKind, PTRS_PER_BLOCK,
@@ -54,8 +54,10 @@ impl SunsetEngine {
         let mut inodes = HashMap::new();
         inodes.insert(ROOT_INODE_ID, root_inode);
 
-        // Serialize root inode
-        let inode_bytes = bincode::serde::encode_to_vec(&inodes, bincode::config::standard())
+        // Serialize root inode deterministically sorted by ino
+        let sorted_inodes: std::collections::BTreeMap<u64, &Inode> =
+            inodes.iter().map(|(k, v)| (*k, v)).collect();
+        let inode_bytes = bincode::serde::encode_to_vec(&sorted_inodes, bincode_config())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize initial inodes: {}", e)))?;
 
         // Allocate block for initial inode table
@@ -67,9 +69,8 @@ impl SunsetEngine {
         block_data[..inode_bytes.len()].copy_from_slice(&inode_bytes);
         block_dev.write_block(inode_block, &block_data)?;
 
-        // Write both superblocks
-        let sb_bytes = bincode::serde::encode_to_vec(&superblock, bincode::config::standard())
-            .map_err(|e| SunsetError::Format(format!("Failed to serialize superblock: {}", e)))?;
+        // Write both superblocks with deterministic wire format
+        let sb_bytes = superblock.to_bytes()?;
         block_dev.write_block(SUPERBLOCK_0_ID, &sb_bytes)?;
         block_dev.write_block(SUPERBLOCK_1_ID, &sb_bytes)?;
         block_dev.flush()?;
@@ -92,20 +93,12 @@ impl SunsetEngine {
         let sb0: Option<SuperblockPayload> = block_dev
             .read_block(SUPERBLOCK_0_ID)
             .ok()
-            .and_then(|bytes| {
-                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                    .ok()
-                    .map(|(sb, _)| sb)
-            });
+            .and_then(|bytes| SuperblockPayload::from_bytes(&bytes).ok());
 
         let sb1: Option<SuperblockPayload> = block_dev
             .read_block(SUPERBLOCK_1_ID)
             .ok()
-            .and_then(|bytes| {
-                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                    .ok()
-                    .map(|(sb, _)| sb)
-            });
+            .and_then(|bytes| SuperblockPayload::from_bytes(&bytes).ok());
 
         let (superblock, active_sb_block) = match (sb0, sb1) {
             (Some(s0), Some(s1)) => {
@@ -120,6 +113,15 @@ impl SunsetEngine {
             (None, None) => return Err(SunsetError::CorruptedBlock(SUPERBLOCK_0_ID)),
         };
 
+        // Truncate trailing disk bytes if container is larger than total_blocks
+        if let Ok(file_len) = block_dev.file_size() {
+            let expected_len = crate::format::HEADER_SIZE as u64
+                + superblock.total_blocks * crate::format::STORED_BLOCK_SIZE as u64;
+            if file_len > expected_len {
+                let _ = block_dev.truncate(superblock.total_blocks);
+            }
+        }
+
         let mut all_inode_bytes = Vec::new();
         for &b in &superblock.inode_blocks {
             let block = block_dev.read_block(b)?;
@@ -130,7 +132,7 @@ impl SunsetEngine {
             HashMap::new()
         } else {
             let (nodes, _): (HashMap<u64, Inode>, usize) =
-                bincode::serde::decode_from_slice(&all_inode_bytes, bincode::config::standard())
+                bincode::serde::decode_from_slice(&all_inode_bytes, bincode_config())
                     .map_err(|e| {
                         SunsetError::Format(format!("Failed to deserialize inode table: {}", e))
                     })?;
@@ -209,6 +211,10 @@ impl SunsetEngine {
                     self.inodes.remove(&ino);
                     self.dirty_inodes.remove(&ino);
                     self.dirty_superblock = true;
+                    if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+                        self.compact()?;
+                        self.flush()?;
+                    }
                 }
             }
         }
@@ -525,8 +531,7 @@ impl SunsetEngine {
                 last_keep_lblock
             };
 
-            let end_lblock = (inode.size + PLAINTEXT_BLOCK_SIZE as u64 - 1)
-                / PLAINTEXT_BLOCK_SIZE as u64;
+            let end_lblock = inode.size.div_ceil(PLAINTEXT_BLOCK_SIZE as u64);
 
             for lb in start_free_lblock..end_lblock {
                 if let Some((pb, _)) = self.resolve_block(ino, lb, false)? {
@@ -534,12 +539,21 @@ impl SunsetEngine {
                     self.clear_block_ref(ino, lb)?;
                 }
             }
+
+            if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+                self.compact()?;
+            }
         }
 
         let node = self.get_inode_mut(ino)?;
         node.size = new_size;
         node.update_mtime();
         self.mark_inode_dirty(ino);
+
+        if new_size < inode.size && self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+            self.flush()?;
+        }
+
         Ok(())
     }
 
@@ -700,6 +714,10 @@ impl SunsetEngine {
     }
 
     pub fn write_dir_data(&mut self, ino: u64, dir: &DirectoryData) -> Result<(), SunsetError> {
+        if dir.is_empty() {
+            self.truncate(ino, 0)?;
+            return Ok(());
+        }
         let bytes = dir.to_bytes()?;
         self.truncate(ino, 0)?;
         self.write_bytes(ino, 0, &bytes)?;
@@ -803,6 +821,10 @@ impl SunsetEngine {
                 self.inodes.remove(&entry.ino);
                 self.dirty_inodes.remove(&entry.ino);
                 self.dirty_superblock = true;
+                if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+                    self.compact()?;
+                    self.flush()?;
+                }
             } else {
                 // Kept alive until handle is released
                 self.mark_inode_dirty(entry.ino);
@@ -840,6 +862,11 @@ impl SunsetEngine {
         let parent = self.get_inode_mut(parent_ino)?;
         parent.nlink = parent.nlink.saturating_sub(1);
         self.mark_inode_dirty(parent_ino);
+
+        if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+            self.compact()?;
+            self.flush()?;
+        }
 
         Ok(())
     }
@@ -907,18 +934,243 @@ impl SunsetEngine {
         }
     }
 
-    pub fn flush(&mut self) -> Result<(), SunsetError> {
-        if self.dirty_inodes.is_empty() && !self.dirty_superblock {
+    fn update_block_reference(&mut self, old_block: u64, new_block: u64) -> Result<bool, SunsetError> {
+        // 1. Check superblock inode table blocks
+        for b in &mut self.superblock.inode_blocks {
+            if *b == old_block {
+                *b = new_block;
+                self.dirty_superblock = true;
+                return Ok(true);
+            }
+        }
+
+        // 2. Check in-memory inodes for direct and root indirect blocks
+        let mut found_ino = None;
+        for (ino, inode) in &mut self.inodes {
+            for direct in &mut inode.direct_blocks {
+                if *direct == old_block {
+                    *direct = new_block;
+                    found_ino = Some(*ino);
+                    break;
+                }
+            }
+            if found_ino.is_some() {
+                break;
+            }
+            if inode.indirect_block == old_block {
+                inode.indirect_block = new_block;
+                found_ino = Some(*ino);
+                break;
+            }
+            if inode.double_indirect_block == old_block {
+                inode.double_indirect_block = new_block;
+                found_ino = Some(*ino);
+                break;
+            }
+            if inode.triple_indirect_block == old_block {
+                inode.triple_indirect_block = new_block;
+                found_ino = Some(*ino);
+                break;
+            }
+        }
+        if let Some(ino) = found_ino {
+            self.dirty_inodes.insert(ino);
+            return Ok(true);
+        }
+
+        // 3. Check inside indirect block trees
+        for inode in self.inodes.values() {
+            // Single indirect block
+            if inode.indirect_block != 0 {
+                let raw = self.block_dev.read_block(inode.indirect_block)?;
+                let mut ptrs = decode_ptrs(&raw);
+                let mut found = false;
+                for p in &mut ptrs {
+                    if *p == old_block {
+                        *p = new_block;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    self.block_dev
+                        .write_block(inode.indirect_block, &encode_ptrs(&ptrs))?;
+                    return Ok(true);
+                }
+            }
+
+            // Double indirect block
+            if inode.double_indirect_block != 0 {
+                let raw1 = self.block_dev.read_block(inode.double_indirect_block)?;
+                let mut ptrs1 = decode_ptrs(&raw1);
+                let mut found = false;
+                for p1 in &mut ptrs1 {
+                    if *p1 == old_block {
+                        *p1 = new_block;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    self.block_dev
+                        .write_block(inode.double_indirect_block, &encode_ptrs(&ptrs1))?;
+                    return Ok(true);
+                }
+
+                // Check inside level 2 blocks
+                for &lvl2 in &ptrs1 {
+                    if lvl2 != 0 {
+                        let raw2 = self.block_dev.read_block(lvl2)?;
+                        let mut ptrs2 = decode_ptrs(&raw2);
+                        let mut found2 = false;
+                        for p2 in &mut ptrs2 {
+                            if *p2 == old_block {
+                                *p2 = new_block;
+                                found2 = true;
+                                break;
+                            }
+                        }
+                        if found2 {
+                            self.block_dev.write_block(lvl2, &encode_ptrs(&ptrs2))?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+
+            // Triple indirect block
+            if inode.triple_indirect_block != 0 {
+                let raw1 = self.block_dev.read_block(inode.triple_indirect_block)?;
+                let mut ptrs1 = decode_ptrs(&raw1);
+                let mut found = false;
+                for p1 in &mut ptrs1 {
+                    if *p1 == old_block {
+                        *p1 = new_block;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    self.block_dev
+                        .write_block(inode.triple_indirect_block, &encode_ptrs(&ptrs1))?;
+                    return Ok(true);
+                }
+
+                for &lvl2 in &ptrs1 {
+                    if lvl2 != 0 {
+                        let raw2 = self.block_dev.read_block(lvl2)?;
+                        let mut ptrs2 = decode_ptrs(&raw2);
+                        let mut found2 = false;
+                        for p2 in &mut ptrs2 {
+                            if *p2 == old_block {
+                                *p2 = new_block;
+                                found2 = true;
+                                break;
+                            }
+                        }
+                        if found2 {
+                            self.block_dev.write_block(lvl2, &encode_ptrs(&ptrs2))?;
+                            return Ok(true);
+                        }
+
+                        for &lvl3 in &ptrs2 {
+                            if lvl3 != 0 {
+                                let raw3 = self.block_dev.read_block(lvl3)?;
+                                let mut ptrs3 = decode_ptrs(&raw3);
+                                let mut found3 = false;
+                                for p3 in &mut ptrs3 {
+                                    if *p3 == old_block {
+                                        *p3 = new_block;
+                                        found3 = true;
+                                        break;
+                                    }
+                                }
+                                if found3 {
+                                    self.block_dev.write_block(lvl3, &encode_ptrs(&ptrs3))?;
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Defragments the archive by moving active blocks from the end of the container
+    /// into free block slots, then truncating the container file.
+    pub fn compact(&mut self) -> Result<(), SunsetError> {
+        if self.superblock.free_blocks.is_empty() {
             return Ok(());
         }
 
-        // Serialize all inodes
-        let inode_bytes = bincode::serde::encode_to_vec(&self.inodes, bincode::config::standard())
+        let mut free_set: std::collections::BTreeSet<u64> =
+            self.superblock.free_blocks.iter().copied().collect();
+
+        while self.superblock.total_blocks > FIRST_ALLOCATABLE_BLOCK {
+            let last_block = self.superblock.total_blocks - 1;
+
+            if free_set.remove(&last_block) {
+                self.superblock.total_blocks -= 1;
+                self.dirty_superblock = true;
+                continue;
+            }
+
+            if let Some(&dest) = free_set.iter().next() {
+                if dest < last_block {
+                    free_set.remove(&dest);
+
+                    let block_data = self.block_dev.read_block(last_block)?;
+                    self.block_dev.write_block(dest, &block_data)?;
+
+                    let updated = self.update_block_reference(last_block, dest)?;
+                    if !updated {
+                        return Err(SunsetError::Format(format!(
+                            "Orphaned block #{} during auto-vacuum compaction",
+                            last_block
+                        )));
+                    }
+
+                    self.superblock.total_blocks -= 1;
+                    self.dirty_superblock = true;
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        self.superblock.free_blocks = free_set.into_iter().collect();
+        self.dirty_superblock = true;
+        Ok(())
+    }
+
+    /// Explicitly trigger compaction and truncate container file to minimum size.
+    pub fn vacuum(&mut self) -> Result<(), SunsetError> {
+        self.compact()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), SunsetError> {
+        if self.dirty_inodes.is_empty() && !self.dirty_superblock && self.superblock.free_blocks.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Compact free blocks if auto-vacuum is enabled
+        if self.superblock.auto_vacuum == AUTO_VACUUM_FULL {
+            self.compact()?;
+        }
+
+        // 2. Serialize all inodes deterministically sorted by ino
+        let sorted_inodes: std::collections::BTreeMap<u64, &Inode> =
+            self.inodes.iter().map(|(k, v)| (*k, v)).collect();
+        let inode_bytes = bincode::serde::encode_to_vec(&sorted_inodes, bincode_config())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize inodes: {}", e)))?;
 
-        let needed_blocks = ((inode_bytes.len() + PLAINTEXT_BLOCK_SIZE - 1)
-            / PLAINTEXT_BLOCK_SIZE)
-            .max(1);
+        let needed_blocks = inode_bytes.len().div_ceil(PLAINTEXT_BLOCK_SIZE).max(1);
 
         // Allocate additional blocks if needed
         while self.superblock.inode_blocks.len() < needed_blocks {
@@ -934,6 +1186,11 @@ impl SunsetEngine {
             self.dirty_superblock = true;
         }
 
+        // Compact again if freeing excess inode blocks created holes
+        if self.superblock.auto_vacuum == AUTO_VACUUM_FULL && !self.superblock.free_blocks.is_empty() {
+            self.compact()?;
+        }
+
         // Write inode blocks
         for (i, &b) in self.superblock.inode_blocks.iter().enumerate() {
             let start = i * PLAINTEXT_BLOCK_SIZE;
@@ -945,15 +1202,14 @@ impl SunsetEngine {
             self.block_dev.write_block(b, &block_data)?;
         }
 
-        // Dual superblock update: increment seq and alternate target
+        // 3. Superblock update: increment sequence counter and timestamp
         self.superblock.seq += 1;
         self.superblock.modified_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let sb_bytes = bincode::serde::encode_to_vec(&self.superblock, bincode::config::standard())
-            .map_err(|e| SunsetError::Format(format!("Failed to serialize superblock: {}", e)))?;
+        let sb_bytes = self.superblock.to_bytes()?;
 
         let target_sb_block = if self.active_sb_block == SUPERBLOCK_0_ID {
             SUPERBLOCK_1_ID
@@ -966,7 +1222,13 @@ impl SunsetEngine {
         self.block_dev.flush()?;
         self.active_sb_block = target_sb_block;
 
-        // Also mirror to the other superblock
+        // Truncate underlying file on disk to exact container length
+        self.block_dev.truncate(self.superblock.total_blocks)?;
+
+        // Update plaintext header change counter
+        let _ = self.block_dev.update_header_change_counter(self.superblock.seq);
+
+        // Mirror to the other superblock
         let other_sb_block = if self.active_sb_block == SUPERBLOCK_0_ID {
             SUPERBLOCK_1_ID
         } else {

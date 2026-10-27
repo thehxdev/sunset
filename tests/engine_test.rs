@@ -60,15 +60,15 @@ fn test_engine_file_crud_and_block_reuse() {
     let read_patched = engine.read_bytes(ino, 4090, patch.len()).unwrap();
     assert_eq!(read_patched, patch);
 
-    // 5. Truncate down to 500 bytes
+    // 5. Truncate down to 500 bytes (file should physically shrink on disk)
     let total_before_truncate = engine.total_blocks();
     engine.truncate(ino, 500).unwrap();
     let truncated_data = engine.read_bytes(ino, 0, 1000).unwrap();
     assert_eq!(truncated_data.len(), 500);
     assert_eq!(&truncated_data[..24], &sample_data[..24]);
 
-    // Check free blocks increased
-    assert!(engine.free_blocks_count() > 0);
+    // Check total blocks shrank on truncation
+    assert!(engine.total_blocks() < total_before_truncate);
 
     // 6. Delete file (unlink)
     engine.unlink(ROOT_INODE_ID, "hello.txt").unwrap();

@@ -175,6 +175,28 @@ impl BlockDevice {
         Ok((file_len - HEADER_SIZE as u64) / STORED_BLOCK_SIZE as u64)
     }
 
+    pub fn file_size(&self) -> Result<u64, SunsetError> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub fn truncate(&mut self, total_blocks: u64) -> Result<(), SunsetError> {
+        let new_len = Self::block_offset(total_blocks);
+        self.file.set_len(new_len)?;
+        self.file.flush()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    pub fn update_header_change_counter(&mut self, counter: u64) -> Result<(), SunsetError> {
+        self.header.change_counter = counter;
+        let bytes = self.header.to_bytes()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&bytes)?;
+        self.file.flush()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<(), SunsetError> {
         self.file.flush()?;
         self.file.sync_data()?;

@@ -156,3 +156,18 @@ If a power failure occurred during a write operation:
    - `export SUNSET_KEY`
 2. **Key Erasure**:
    `sunset` uses the `Zeroize` trait to zero out derived master keys and sensitive buffers from process memory when dropped.
+
+---
+
+## 7. Container Compaction and Shrinking on File Deletion
+
+`sunset` includes SQLite-inspired auto-vacuum compaction:
+- **Instant Disk Reclaim**: When a file is unlinked (`rm` on FUSE mount or `sunset rm`), or truncated down, vacated physical blocks are reclaimed. If holes exist inside the archive, trailing blocks are moved into the vacant slots and the container file is truncated using `set_len`.
+- **Manual Vacuum**: You can trigger explicit defragmentation anytime via:
+  ```bash
+  sunset vacuum /data/vault.bin -k "MySecretKey"
+  ```
+- **Inspect Container Metadata**: Check container wire layout, block counts, and CRC32 without needing the encryption key:
+  ```bash
+  sunset info /data/vault.bin
+  ```

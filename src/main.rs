@@ -419,6 +419,81 @@ fn run() -> Result<(), SunsetError> {
             engine.flush()?;
             println!("Created directory '{}' in archive", path);
         }
+
+        Commands::Rm {
+            archive,
+            path,
+            key,
+            key_file,
+            key_stdin,
+        } => {
+            ensure_archive_exists(&archive)?;
+            let k = resolve_key(key, key_file, key_stdin, false)?;
+            let mut engine = SunsetEngine::open(&archive, &k)?;
+            let (parent_ino, name) = resolve_parent_and_name(&mut engine, &path)?;
+            let node = engine.lookup(parent_ino, &name)?;
+            if node.kind == InodeKind::Directory {
+                engine.rmdir(parent_ino, &name)?;
+            } else {
+                engine.unlink(parent_ino, &name)?;
+            }
+            engine.flush()?;
+            println!("Removed '{}' from archive (container shrank)", path);
+        }
+
+        Commands::Vacuum {
+            archive,
+            key,
+            key_file,
+            key_stdin,
+        } => {
+            ensure_archive_exists(&archive)?;
+            let k = resolve_key(key, key_file, key_stdin, false)?;
+            let before_size = std::fs::metadata(&archive)?.len();
+            let mut engine = SunsetEngine::open(&archive, &k)?;
+            engine.vacuum()?;
+            let after_size = std::fs::metadata(&archive)?.len();
+            println!(
+                "Vacuum complete: container shrank from {} bytes to {} bytes (reclaimed {} bytes).",
+                before_size,
+                after_size,
+                before_size.saturating_sub(after_size)
+            );
+        }
+
+        Commands::Info { archive } => {
+            ensure_archive_exists(&archive)?;
+            let mut file = std::fs::File::open(&archive)?;
+            let file_len = file.metadata()?.len();
+            let mut header_buf = [0u8; sunset::format::HEADER_SIZE];
+            std::io::Read::read_exact(&mut file, &mut header_buf)?;
+
+            let header = sunset::format::OnDiskHeader::from_bytes(&header_buf)?;
+            let sig_str = String::from_utf8_lossy(&header.signature);
+
+            println!("Sunset Archive Container Information");
+            println!("===================================");
+            println!("File:                 {}", archive.display());
+            println!("File size on disk:    {} bytes", file_len);
+            println!("Signature:            {:?} ({})", header.signature, sig_str.trim_matches('\0'));
+            println!("Format version:       {}", header.format_version);
+            println!("Compatible version:   {}", header.compat_version);
+            println!("Application ID:       0x{:08X}", header.app_id);
+            println!("Plaintext block size: {} bytes", header.block_size);
+            println!("Physical block size:  {} bytes", header.stored_block_size);
+            println!("Change counter:       {}", header.change_counter);
+            println!("Auto-vacuum mode:     {}", if header.auto_vacuum == 1 { "FULL (auto-shrink enabled)" } else { "NONE" });
+            println!("KDF Algorithm:        Argon2id (m_cost={}, t_cost={}, p_cost={})", header.m_cost, header.t_cost, header.p_cost);
+            println!("Cipher Algorithm:     XChaCha20-Poly1305 (256-bit key, 192-bit nonce, 128-bit MAC)");
+            println!("Header Checksum:      0x{:08X} (VALID)", header.checksum);
+
+            let total_stored_blocks = if file_len >= sunset::format::HEADER_SIZE as u64 {
+                (file_len - sunset::format::HEADER_SIZE as u64) / sunset::format::STORED_BLOCK_SIZE as u64
+            } else {
+                0
+            };
+            println!("Physical blocks:      {}", total_stored_blocks);
+        }
     }
 
     Ok(())

@@ -193,6 +193,51 @@ pub enum Commands {
         #[arg(long)]
         key_stdin: bool,
     },
+
+    /// Remove a file or empty directory from inside the encrypted archive
+    Rm {
+        /// Path to the archive binary file
+        archive: PathBuf,
+
+        /// Path inside archive to delete
+        path: String,
+
+        /// Encryption key
+        #[arg(short, long)]
+        key: Option<String>,
+
+        /// Path to a file containing the encryption key
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Read encryption key from standard input
+        #[arg(long)]
+        key_stdin: bool,
+    },
+
+    /// Defragment archive and shrink container file to minimum physical size (like SQLite vacuum)
+    Vacuum {
+        /// Path to the archive binary file
+        archive: PathBuf,
+
+        /// Encryption key
+        #[arg(short, long)]
+        key: Option<String>,
+
+        /// Path to a file containing the encryption key
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Read encryption key from standard input
+        #[arg(long)]
+        key_stdin: bool,
+    },
+
+    /// Display archive container format specification and metadata
+    Info {
+        /// Path to the archive binary file
+        archive: PathBuf,
+    },
 }
 
 pub fn resolve_key(
@@ -280,5 +325,5 @@ pub fn parse_size_to_blocks(size_str: &str) -> Result<u64, SunsetError> {
         .map_err(|_| SunsetError::InvalidArgument(format!("Invalid size format: '{}' (examples: '100M', '2G')", size_str)))?
         * mult;
 
-    Ok((bytes + 4095) / 4096)
+    Ok(bytes.div_ceil(4096))
 }

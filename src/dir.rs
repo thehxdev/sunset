@@ -1,5 +1,5 @@
 use crate::error::SunsetError;
-use crate::format::MAX_NAME_LEN;
+use crate::format::{bincode_config, MAX_NAME_LEN};
 use crate::inode::InodeKind;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,7 @@ impl DirectoryData {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SunsetError> {
-        bincode::serde::encode_to_vec(self, bincode::config::standard())
+        bincode::serde::encode_to_vec(self, bincode_config())
             .map_err(|e| SunsetError::Format(format!("Failed to serialize directory: {}", e)))
     }
 
@@ -31,7 +31,7 @@ impl DirectoryData {
         if slice.is_empty() {
             return Ok(Self::new());
         }
-        let (data, _): (Self, usize) = bincode::serde::decode_from_slice(slice, bincode::config::standard())
+        let (data, _): (Self, usize) = bincode::serde::decode_from_slice(slice, bincode_config())
             .map_err(|e| SunsetError::Format(format!("Failed to deserialize directory: {}", e)))?;
         Ok(data)
     }

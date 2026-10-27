@@ -7,6 +7,9 @@
 ## Key Features
 
 - **Single Binary Container**: Entire file system (inodes, directory trees, file contents, free lists) stored inside one portable file (e.g. `vault.bin`).
+- **Dedicated Project Signature**: Clean 16-byte signature `b"SUNSET format 1\0"` directly inspired by SQLite3.
+- **Physical Shrinking on Deletion**: True auto-vacuum compaction: when files are unlinked or truncated, interior blocks are defragmented and the host file is physically truncated (`set_len`). Reclaims disk space immediately.
+- **Cross-Platform Determinism**: Strictly specified little-endian wire format, explicit field offsets, IEEE 802.3 CRC32 checksums, and architecture-independent layout across Linux, macOS, and Windows.
 - **Strong Stream Cipher**: Pure Rust `XChaCha20-Poly1305` authenticated encryption (256-bit key, 192-bit random nonce, 128-bit Poly1305 MAC tag).
 - **Relocation & Tamper Defense**: Block indices authenticated as Additional Authenticated Data (AAD). Block reordering or bit flips immediately rejected with I/O error.
 - **Argon2id Key Derivation**: High-entropy 256-bit key derived from user passphrase with 32-byte CSPRNG salt.
@@ -14,35 +17,64 @@
 - **Huge File Support**: 12 direct blocks, single-indirect, double-indirect, and triple-indirect block mapping supporting files up to 512 GB with sparse hole allocation.
 - **Masked Interactive Input**: Prompts securely with hidden input if keys omitted on terminal. Also supports `-k`, `--key-file`, `--key-stdin`, and `SUNSET_KEY`.
 - **POSIX Semantics**: Standard directory traversal, file handles, unlinking open files, file truncation, permissions (`umask`), timestamps, and read-only (`-o ro`) mount.
-- **Dual-Mode Operation**: Mounts via FUSE or operates headlessly via built-in archive commands (`ls`, `cat`, `put`, `get`, `mkdir`, `check`).
+- **Dual-Mode Operation**: Mounts via FUSE or operates headlessly via built-in archive commands (`ls`, `cat`, `put`, `get`, `mkdir`, `rm`, `vacuum`, `info`, `check`).
 
 ---
 
-## On-Disk Binary Format
+## On-Disk Binary Format Specification
 
-```
-+-------------------------------------------------------------------------+
-| Plaintext Header (Offset 0x0000 - 0x00FF, 256 bytes)                    |
-| - Magic: b"SUNSETFS" (8 bytes)                                          |
-| - Format Version: u32 = 1 (4 bytes)                                     |
-| - Plaintext Block Size: u32 = 4096 (4 bytes)                            |
-| - Stored Block Size: u32 = 4136 (4 bytes)                               |
-| - Salt: [u8; 32] (Argon2id salt)                                        |
-| - Argon2id Params: m_cost (4), t_cost (4), p_cost (4)                   |
-| - Verification Token: Nonce (24) + Ciphertext (32) + Poly1305 Tag (16)  |
-| - Reserved Padding (120 bytes)                                          |
-+-------------------------------------------------------------------------+
-| Block 0: Primary Superblock (4136 bytes: Nonce[24] + Encrypted[4096] + Tag[16]) |
-+-------------------------------------------------------------------------+
-| Block 1: Backup Superblock  (4136 bytes: Nonce[24] + Encrypted[4096] + Tag[16]) |
-+-------------------------------------------------------------------------+
-| Block 2..N: Encrypted Inode Tables, Directory Tables, Data Blocks       |
-+-------------------------------------------------------------------------+
-```
+The container begins with an unencrypted, fixed 256-byte header followed by encrypted, authenticated 4136-byte physical blocks.
 
-Every physical block is stored as:
-$$\text{Physical Block} = \text{Nonce}_{24} \,\|\, \text{Ciphertext}_{4096} \,\|\, \text{Poly1305 Tag}_{16}$$
-Decryption uses $\text{AAD} = \text{block\_index}_{\text{u64 (LE)}}$.
+### 1. Plaintext Container Header (Offset 0x0000 - 0x00FF, 256 bytes)
+
+All multi-byte numeric values are encoded in standard **Little-Endian**.
+
+| Byte Offset | Size | Type | Field Description |
+|:---|:---:|:---:|:---|
+| `0x00..0x10` | 16 | `[u8; 16]` | Magic Signature string: `b"SUNSET format 1\0"` |
+| `0x10..0x14` | 4 | `u32` (LE) | Format write version (`1`) |
+| `0x14..0x18` | 4 | `u32` (LE) | Minimum compatible read version (`1`) |
+| `0x18..0x1C` | 4 | `u32` (LE) | Plaintext block size (`4096`) |
+| `0x1C..0x20` | 4 | `u32` (LE) | Stored physical block size (`4136`) |
+| `0x20..0x24` | 4 | `u32` (LE) | KDF algorithm ID (`1` = Argon2id v13) |
+| `0x24..0x28` | 4 | `u32` (LE) | KDF memory cost `m_cost` in KiB (`65536`) |
+| `0x28..0x2C` | 4 | `u32` (LE) | KDF time cost iterations `t_cost` (`3`) |
+| `0x2C..0x30` | 4 | `u32` (LE) | KDF parallelism lanes `p_cost` (`4`) |
+| `0x30..0x50` | 32 | `[u8; 32]` | Argon2id salt (32 random bytes) |
+| `0x50..0x54` | 4 | `u32` (LE) | Cipher algorithm ID (`1` = XChaCha20-Poly1305) |
+| `0x54..0x6C` | 24 | `[u8; 24]` | Key verification nonce |
+| `0x6C..0x8C` | 32 | `[u8; 32]` | Key verification ciphertext token |
+| `0x8C..0x9C` | 16 | `[u8; 16]` | Key verification Poly1305 MAC tag |
+| `0x9C..0xA0` | 4 | `u32` (LE) | Auto-vacuum mode (`1` = Full auto-shrink on deletion) |
+| `0xA0..0xA8` | 8 | `u64` (LE) | Change counter / generation counter |
+| `0xA8..0xAC` | 4 | `u32` (LE) | Application ID (`0x53554E53` / ASCII "SUNS") |
+| `0xAC..0xFC` | 80 | `[u8; 80]` | Reserved bytes for future expansion (0x00) |
+| `0xFC..0x100` | 4 | `u32` (LE) | IEEE 802.3 CRC-32 checksum (covers bytes `0x00..0xFC`) |
+
+### 2. Physical Block Structure (Offset 0x0100+, 4136 bytes each)
+
+Every physical block on disk contains:
+$$\text{Stored Block} = \text{Nonce}_{24} \,\|\, \text{Ciphertext}_{4096} \,\|\, \text{Poly1305 Tag}_{16}$$
+- **Additional Authenticated Data (AAD)**: $\text{Physical Block Index}_{\text{u64 (LE)}}$.
+
+### 3. Dual-Superblock Layout (Blocks 0 & 1)
+- **Block 0 (Offset 256)**: Superblock Primary
+- **Block 1 (Offset 4392)**: Superblock Secondary (Mirror)
+- **Decrypted Payload (4096 bytes)**:
+  - Magic: `b"SUNSETSB"` (8B)
+  - Version: `u32` (4B)
+  - Sequence Counter: `u64` (8B)
+  - Root Inode ID: `u64` (8B)
+  - Next Inode ID: `u64` (8B)
+  - Total Physical Blocks: `u64` (8B)
+  - Modified Timestamp: `u64` (8B)
+  - Auto-Vacuum Flag: `u32` (4B)
+  - Freelist Trunk Block: `u64` (8B)
+  - Inode Table Blocks Count: `u32` (4B)
+  - Free Blocks Count: `u32` (4B)
+  - Payload CRC32: `u32` (4B)
+  - Inode Table Block Index List: `[u64; N]` (LE)
+  - Inline Free Blocks List: `[u64; M]` (LE)
 
 ---
 
@@ -76,15 +108,18 @@ sunset --version
 Usage: sunset <COMMAND>
 
 Commands:
-  init   Initialize a new encrypted file-system archive with an encryption key
-  mount  Mount the encrypted archive directly to a local directory via FUSE
-  check  Verify key and check integrity of all encrypted blocks in archive
-  ls     List directory contents inside archive
-  cat    Output file contents from archive to stdout
-  put    Copy a host file into the encrypted archive
-  get    Extract a file from the encrypted archive to host
-  mkdir  Create a directory inside the encrypted archive
-  help   Print this message or the help of the given subcommand(s)
+  init    Initialize a new encrypted file-system archive with an encryption key
+  mount   Mount the encrypted archive directly to a local directory via FUSE
+  check   Verify key and check integrity of all encrypted blocks in archive
+  ls      List directory contents inside archive
+  cat     Output file contents from archive to stdout
+  put     Copy a host file into the encrypted archive
+  get     Extract a file from the encrypted archive to host
+  mkdir   Create a directory inside the encrypted archive
+  rm      Remove a file or empty directory from inside the encrypted archive
+  vacuum  Defragment archive and shrink container file to minimum physical size
+  info    Display archive container format specification and metadata
+  help    Print this message or the help of the given subcommand(s)
 ```
 
 ### Common Authentication Flags
@@ -208,6 +243,15 @@ sunset get vault.bin docs/reports/q3.pdf /tmp/extracted_q3.pdf -k "MySecretKey"
 
 # Create a folder inside archive
 sunset mkdir vault.bin docs/backups -k "MySecretKey"
+
+# Remove a file from archive (container physically shrinks on disk)
+sunset rm vault.bin docs/reports/q3.pdf -k "MySecretKey"
+
+# Defragment and vacuum container
+sunset vacuum vault.bin -k "MySecretKey"
+
+# Inspect archive container header and specification (no password required)
+sunset info vault.bin
 ```
 
 ---

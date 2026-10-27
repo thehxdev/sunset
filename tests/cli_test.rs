@@ -155,6 +155,44 @@ fn test_cli_end_to_end() {
     assert!(output.status.success());
     assert_eq!(output.stdout, src_content);
 
+    // 11. sunset info displays format specification and valid checksum
+    let output = Command::new(&sunset_bin)
+        .arg("info")
+        .arg(&archive_path)
+        .output()
+        .expect("Failed to run sunset info");
+    assert!(output.status.success());
+    let info_out = String::from_utf8_lossy(&output.stdout);
+    assert!(info_out.contains("SUNSET format 1"));
+    assert!(info_out.contains("VALID"));
+    assert!(info_out.contains("XChaCha20-Poly1305"));
+
+    // 12. sunset rm deletes file and shrinks container
+    let size_before_rm = std::fs::metadata(&archive_path).unwrap().len();
+    let output = Command::new(&sunset_bin)
+        .arg("rm")
+        .arg(&archive_path)
+        .arg("nested_dir/data.bin")
+        .arg("--key-file")
+        .arg(&key_file)
+        .output()
+        .expect("Failed to run sunset rm");
+    assert!(output.status.success());
+    let size_after_rm = std::fs::metadata(&archive_path).unwrap().len();
+    assert!(size_after_rm < size_before_rm, "Container must shrink on rm");
+
+    // 13. sunset vacuum
+    let output = Command::new(&sunset_bin)
+        .arg("vacuum")
+        .arg(&archive_path)
+        .arg("--key-file")
+        .arg(&key_file)
+        .output()
+        .expect("Failed to run sunset vacuum");
+    assert!(output.status.success());
+    let vac_out = String::from_utf8_lossy(&output.stdout);
+    assert!(vac_out.contains("Vacuum complete"));
+
     // Cleanup
     let _ = std::fs::remove_file(&archive_path);
     let _ = std::fs::remove_file(&key_file);

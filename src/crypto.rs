@@ -104,6 +104,7 @@ pub fn decrypt_block(
         .map_err(|_| CryptoError::AuthFailed)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn create_verification_token(
     key: &MasterKey,
 ) -> Result<([u8; NONCE_SIZE], [u8; VERIFY_MSG_LEN], [u8; TAG_SIZE]), CryptoError> {

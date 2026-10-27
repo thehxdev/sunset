@@ -31,7 +31,7 @@ fn inode_to_fileattr(node: &Inode) -> FileAttr {
     let mtime = UNIX_EPOCH + Duration::new(node.mtime_secs.max(0) as u64, node.mtime_nanos);
     let ctime = UNIX_EPOCH + Duration::new(node.ctime_secs.max(0) as u64, node.ctime_nanos);
 
-    let blocks = (node.size + 511) / 512;
+    let blocks = node.size.div_ceil(512);
 
     FileAttr {
         ino: INodeNo(node.ino),
